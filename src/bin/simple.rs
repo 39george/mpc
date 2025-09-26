@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use cggmp24::PregeneratedPrimes;
 use cggmp24::Signature;
 use cggmp24::key_share::DirtyAuxInfo;
 use cggmp24::key_share::Valid;
@@ -15,6 +16,10 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use sha2::Sha256;
 use signature::Verifier;
 use tokio::task::spawn_blocking;
+use tracing::Instrument;
+use tracing::Level;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt;
 
 type AuxMsg = cggmp24::key_refresh::msg::Msg<Sha256, Mid>;
 
@@ -42,11 +47,37 @@ define_security_level!(Mid {
     m: 128,
 });
 
+// ┌─────────────────────────────────────────────────────────────┐
+// │                    Endpoint для участника i                 │
+// │                                                             │
+// │  ВНУТРЕННИЙ ИНТЕРФЕЙС (для MPC протокола)                   │
+// │  ┌─────────────────┐        ┌─────────────────┐             │
+// │  │     in_rx       │◄───────│     out_tx      │             │
+// │  │ (Mutex<Option<  │        │   (копируемый)  │             │
+// │  │ UnboundedRx>>)  │        │  UnboundedTx    │             │
+// │  └─────────────────┘        └─────────────────┘             │
+// │       ▲                              │                      │
+// │       │                              ▼                      │
+// │  MPC протокол                  MPC протокол                 │
+// │  получает сообщения           отправляет сообщения          │
+// │                                                             │
+// │  ВНЕШНИЙ ИНТЕРФЕЙС (для роутера)                            │
+// │  ┌─────────────────┐        ┌─────────────────┐             │
+// │  │     in_tx       │───────►│     out_rx      │             │
+// │  │   (копируемый)  │        │ (Mutex<Option<  │             │
+// │  │  UnboundedTx    │        │ UnboundedRx>>)  │             │
+// │  └─────────────────┘        └─────────────────┘             │
+// └─────────────────────────────────────────────────────────────┘
 struct Endpoint<M> {
+    /// ВХОДная дверь. Роутер пишет сюда сообщения, предназначенные этому участнику
     in_tx: UnboundedSender<Incoming<M>>,
-    in_rx: Mutex<Option<UnboundedReceiver<Incoming<M>>>>,
-    out_tx: UnboundedSender<Outgoing<M>>,
+    /// ИСХОДной почтовый ящик. Роутер читает отсюда сообщения для маршрутизации
     out_rx: Mutex<Option<UnboundedReceiver<Outgoing<M>>>>,
+
+    /// ВХОДной почтовый ящик. MPC протокол читает отсюда сообщения
+    in_rx: Mutex<Option<UnboundedReceiver<Incoming<M>>>>,
+    /// ИСХОДная дверь. MPC протокол пишет сюда сообщения для отправки другим
+    out_tx: UnboundedSender<Outgoing<M>>,
 }
 
 fn new_endpoint<M>() -> Endpoint<M> {
@@ -60,53 +91,74 @@ fn new_endpoint<M>() -> Endpoint<M> {
     }
 }
 
+// Участник 0 (my_index=0) хочет отправить сообщение участнику 2:
+//
+// ┌─────────────┐    out_tx.send()    ┌─────────────┐    peers_in.get(&2)   ┌─────────────┐
+// │   MPC прот. │ ──────────────────► │   Роутер 0  │ ────────────────────► │   Роутер 2  │
+// │  участника 0│                     │             │                       │             │
+// └─────────────┘                     └─────────────┘                       └─────────────┘
+//                                          │                                      │
+//                                          ▼                                      ▼
+//                                    out_rx.next().await                    in_tx.send(msg)
+//                                                                                 │
+//                                                                                 ▼
+//                                                                         ┌─────────────┐
+//                                                                         │   MPC прот. │
+//                                                                         │  участника 2│
+//                                                                         └─────────────┘
 fn spawn_router<M: Clone + Send + Sync + 'static>(
+    // Индекс ЭТОГО участника
     my_index: u16,
+    // Исходящие сообщения ОТ этого участника
     mut out_rx: UnboundedReceiver<Outgoing<M>>,
+    // Каналы К другим участникам
     peers_in: std::collections::HashMap<u16, UnboundedSender<Incoming<M>>>,
 ) {
-    tokio::spawn(async move {
-        let mut next_id: u64 = 0;
-        while let Some(out) = out_rx.next().await {
-            match out.recipient {
-                MessageDestination::OneParty(idx) => {
-                    if let Some(peer_in) = peers_in.get(&idx) {
-                        let id = {
-                            let x = next_id;
-                            next_id += 1;
-                            x
-                        };
-                        let incoming = Incoming {
-                            sender: my_index,
-                            msg: out.msg, // move
-                            id,
-                            msg_type: MessageType::P2P,
-                        };
-                        let _ = peer_in.unbounded_send(incoming);
-                    }
-                }
-                MessageDestination::AllParties => {
-                    for (&idx, peer_in) in &peers_in {
-                        if idx == my_index {
-                            continue;
+    tokio::spawn(
+        async move {
+            let mut next_id: u64 = 0;
+            while let Some(out) = out_rx.next().await {
+                match out.recipient {
+                    MessageDestination::OneParty(idx) => {
+                        if let Some(peer_in) = peers_in.get(&idx) {
+                            let id = {
+                                let x = next_id;
+                                next_id += 1;
+                                x
+                            };
+                            let incoming = Incoming {
+                                sender: my_index,           // От кого
+                                msg: out.msg,               // Что
+                                id,                         // Идентификатор
+                                msg_type: MessageType::P2P, // Тип
+                            };
+                            let _ = peer_in.unbounded_send(incoming); // Отправляем в in_tx участника 2
                         }
-                        let id = {
-                            let x = next_id;
-                            next_id += 1;
-                            x
-                        };
-                        let incoming = Incoming {
-                            sender: my_index,
-                            msg: out.msg.clone(), // clone для рассылки
-                            id,
-                            msg_type: MessageType::Broadcast,
-                        };
-                        let _ = peer_in.unbounded_send(incoming);
+                    }
+                    MessageDestination::AllParties => {
+                        for (&idx, peer_in) in &peers_in {
+                            if idx == my_index {
+                                continue;
+                            }
+                            let id = {
+                                let x = next_id;
+                                next_id += 1;
+                                x
+                            };
+                            let incoming = Incoming {
+                                sender: my_index,
+                                msg: out.msg.clone(), // clone для рассылки
+                                id,
+                                msg_type: MessageType::Broadcast,
+                            };
+                            let _ = peer_in.unbounded_send(incoming);
+                        }
                     }
                 }
             }
         }
-    });
+        .instrument(tracing::info_span!("spawning router")),
+    );
 }
 
 fn make_party<M>(
@@ -118,7 +170,6 @@ fn make_party<M>(
         UnboundedSender<Outgoing<M>>,
     ),
 > {
-    println!("trying to aquire lock");
     let incoming = ep
         .in_rx
         .lock()
@@ -132,6 +183,7 @@ fn make_party<M>(
 
 fn setup_network<M: Clone + Send + Sync + 'static>(n: u16) -> Vec<Endpoint<M>> {
     let eps: Vec<Endpoint<M>> = (0..n).map(|_| new_endpoint()).collect();
+    tracing::info!("created endpoints for {n}");
     for i in 0..n {
         let mut peers_in = std::collections::HashMap::new();
         for j in 0..n {
@@ -156,8 +208,9 @@ fn setup_network<M: Clone + Send + Sync + 'static>(n: u16) -> Vec<Endpoint<M>> {
 async fn main() -> anyhow::Result<()> {
     use cggmp24::{DataToSign, ExecutionId, KeyShare};
     use rand::rngs::OsRng;
+    setup_tracing();
 
-    let n: u16 = 3;
+    let n: u16 = 4;
 
     // ---------- 1) AUX ----------
     let eps = setup_network::<AuxMsg>(n);
@@ -169,11 +222,29 @@ async fn main() -> anyhow::Result<()> {
             futures::future::try_join_all((0..n).map(|i| {
                 let party = make_party(&eps[i as usize]);
                 async move {
-                    let preg = spawn_blocking(|| {
-                        cggmp24::PregeneratedPrimes::<Mid>::generate(&mut OsRng)
-                    })
-                    .await
-                    .unwrap();
+                    let preg = match read_preg(i) {
+                        Ok(p) => {
+                            tracing::info!("found {i} primes");
+                            p
+                        }
+                        _ => {
+                            let preg = spawn_blocking(|| {
+                                cggmp24::PregeneratedPrimes::<Mid>::generate(
+                                    &mut OsRng,
+                                )
+                            })
+                            .instrument(tracing::info_span!(
+                                "generate primes",
+                                idx = i
+                            ))
+                            .await
+                            .unwrap();
+                            let preg_s = serde_json::to_string(&preg).unwrap();
+                            std::fs::write(format!("preg_{i}.json"), preg_s)
+                                .unwrap();
+                            preg
+                        }
+                    };
                     cggmp24::aux_info_gen(eid_aux, i, n, preg)
                         .set_progress_tracer(
                             &mut cggmp24::progress::Stderr::new(),
@@ -185,8 +256,8 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
     };
-    let s = serde_json::to_string(&aux_infos).unwrap();
-    std::fs::write("aux_infos.json", s).unwrap();
+    // let s = serde_json::to_string(&aux_infos).unwrap();
+    // std::fs::write("aux_infos.json", s).unwrap();
     drop(eps); // удобнее пересобрать каналы на следующий протокол
     println!("Aux stage done\n\n");
 
@@ -312,7 +383,34 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn extract_aux_infos() -> anyhow::Result<Vec<Valid<DirtyAuxInfo<Mid>>>> {
+    tracing::info!("extract aux infos");
     let file = std::fs::read_to_string("aux_infos.json")?;
     let data = serde_json::from_str::<Vec<Valid<DirtyAuxInfo<Mid>>>>(&file)?;
     Ok(data)
+}
+
+fn read_preg(idx: u16) -> anyhow::Result<PregeneratedPrimes<Mid>> {
+    tracing::info!("read preg with idx {idx}");
+    let file = std::fs::read_to_string(format!("preg_{idx}.json"))?;
+    let data = serde_json::from_str(&file)?;
+    Ok(data)
+}
+
+fn setup_tracing() {
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_file(true)
+        .with_line_number(true)
+        .compact()
+        .with_level(true);
+    let env_layer = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(Level::INFO.into())
+        .add_directive("axum::rejection=trace".parse().unwrap());
+
+    let subscriber = tracing_subscriber::registry() // Use registry as base
+        .with(fmt_layer)
+        .with(env_layer);
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set up tracing");
 }

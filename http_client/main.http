@@ -1,0 +1,24 @@
+# @name CreateSession
+POST {{HOST}}/api/v1/session HTTP/1.1
+Content-Type: application/json
+
+{
+    "session_type": "AuxInfoGen",
+    "participants": [
+       "cb5f5ced-4baa-4c25-99ac-3f536c2933fc", 
+       "b1e37f88-5c1d-444d-8d3b-2362caa1b918", 
+       "e7f89edb-748a-4eff-bc8a-129bde0612c6"
+    ],
+    "tag": "NewSession"
+}
+
+### 
+
+# @name ListSessions
+GET {{HOST}}/api/v1/sessions HTTP/1.1
+Signer-Id: e7f89edb-748a-4eff-bc8a-129bde0612c6
+
+### 
+
+# @name StartSession
+POST {{HOST}}/api/v1/session/ed9adce51a2c2ecb7c1067029b47c80fb0c1f86993fe9c15c95244378cc6c5fc/start HTTP/1.1

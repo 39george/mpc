@@ -3,6 +3,18 @@ name = "mpc"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "simple"
+path = "src/bin/simple.rs"
+
+[[bin]]
+name = "manager"
+path = "src/bin/manager.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
 [dependencies]
 cggmp24 = { version = "0.7.0-alpha.1", features = ["hd-wallet", "curve-secp256k1"] }
 cggmp24-keygen = { version = "0.7.0-alpha.1" }
@@ -19,3 +31,24 @@ async-stream = "0.3"
 tronic = "0.3"
 k256 = { version = "0.13", features = ["ecdsa"] }
 signature = "2.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+  "chrono",
+  "registry",
+  "env-filter",
+] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+axum = { version = "0.8", features = ["macros", "tracing", "multipart", "ws"] }
+tokio-tungstenite = { version = "0.28", features = ["connect"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+] }
+http = "1.3"
+http-body-util = "0.1"
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+thiserror = "2.0"
+derivative = "2.2.0"
+clap = { version = "4.5", features = ["derive"] }
+hyper = "1.7"
+hyper-util = "0.1"
+url = "2.5"
