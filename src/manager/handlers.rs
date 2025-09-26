@@ -17,7 +17,6 @@ use std::collections::HashSet;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::AuxMsg;
 use crate::manager::error::ErrorResponse;
 use crate::manager::error::Result;
 use crate::protocol;
@@ -29,7 +28,7 @@ pub struct SessionManager {
     // Key: PartyIndex (0..N-1)
     // Value: Sender (канал для отправки MPC сообщений участнику)
     pub party_channels:
-        HashMap<u16, UnboundedSender<protocol::Incoming<AuxMsg>>>,
+        HashMap<u16, UnboundedSender<protocol::Incoming<Vec<u8>>>>,
     // Дополнительные метаданные сессии: N, T, ExecutionId и т.д.
     pub metadata: SessionMetadata,
     // Можно добавить стейт-машину для отслеживания прогресса DKG
@@ -45,9 +44,8 @@ pub enum SessionStatus {
 
 pub struct SessionMetadata {
     pub participants: Vec<Uuid>,
-    pub threshold: Option<u16>,
     // КЛЮЧЕВОЕ ПОЛЕ
-    pub session_type: SessionType,
+    pub session_type: protocol::SessionType,
     pub tag: String,
     pub status: SessionStatus,
 }
@@ -56,21 +54,9 @@ pub struct SessionMetadata {
 #[derive(Deserialize, Serialize)]
 pub struct StartSessionRequest {
     pub tag: String,
-    // Порог, нужен только для KeyGen/Signing
-    pub threshold: Option<u16>,
     // КЛЮЧЕВОЕ ПОЛЕ
-    pub session_type: SessionType,
+    pub session_type: protocol::SessionType,
     pub participants: HashSet<Uuid>,
-}
-
-#[derive(Deserialize, Serialize)]
-pub enum SessionType {
-    // 1. Предварительная фаза. Требует N участников. Результат - кэшируемые AuxInfo.
-    AuxInfoGen,
-    // 2. Генерация общего секрета. Требует N участников и T. Результат - доля секрета.
-    KeyGen,
-    // 3. Подписание транзакции. Требует T из N участников.
-    Signing,
 }
 
 // ДЛЯ КООРДИНАТОРА
@@ -89,8 +75,8 @@ pub async fn create_session(
     hasher.update(serde_json::to_vec(&sorted_participants).unwrap());
     hasher.update(serde_json::to_vec(&req.session_type).unwrap());
     // Если KeyGen/Signing, добавить T
-    if let Some(t) = req.threshold {
-        hasher.update(&t.to_le_bytes());
+    if let protocol::SessionType::KeyGen { threshold } = req.session_type {
+        hasher.update(&threshold.to_le_bytes());
     }
     let session_id = hex::encode(hasher.finalize().to_vec());
 
@@ -102,7 +88,6 @@ pub async fn create_session(
             party_channels: Default::default(),
             metadata: SessionMetadata {
                 participants: sorted_participants,
-                threshold: req.threshold,
                 session_type: req.session_type,
                 tag: req.tag,
                 status: SessionStatus::Pending,
@@ -190,6 +175,7 @@ pub async fn connect_session(
     session_manager.party_channels.insert(party_idx, in_tx);
     let n = session_manager.metadata.participants.len();
     let start_cmd_rx = session_manager.start_cmd.subscribe();
+    let session_type = session_manager.metadata.session_type;
 
     drop(session_lock);
     Ok(ws.on_upgrade(move |socket| {
@@ -200,6 +186,7 @@ pub async fn connect_session(
             start_cmd_rx,
             party_idx,
             n as u16,
+            session_type,
             session_id,
         )
     }))
@@ -218,7 +205,8 @@ pub async fn start_session(
         .get_mut(&session_id)
         .context("no session found")
         .map_err(ErrorResponse::NotFound)?;
-    if let Some(threshold) = session_manager.metadata.threshold
+    if let protocol::SessionType::KeyGen { threshold } =
+        session_manager.metadata.session_type
         && session_manager.party_channels.len() < threshold as usize
     {
         return Err(ErrorResponse::Conflict(anyhow!(
@@ -235,6 +223,7 @@ pub async fn start_session(
         .start_cmd
         .send(())
         .context("failed to send start cmd")?;
+    session_manager.metadata.status = SessionStatus::Running;
     Ok(StatusCode::OK)
 }
 
@@ -253,15 +242,20 @@ pub async fn session_status() -> StatusCode {
 async fn handle_ws(
     state: super::AppState,
     mut ws: axum::extract::ws::WebSocket,
-    mut in_rx: UnboundedReceiver<protocol::Incoming<AuxMsg>>,
+    mut in_rx: UnboundedReceiver<protocol::Incoming<Vec<u8>>>,
     mut start_cmd: broadcast::Receiver<()>,
     party_idx: u16,
     n: u16,
+    session_type: protocol::SessionType,
     session_id: String,
 ) {
     tokio::spawn(async move {
         let msg = serde_json::to_vec(&protocol::Message {
-            data: protocol::Data::<AuxMsg>::StartCmd { i: party_idx, n },
+            data: protocol::Data::<Vec<u8>>::StartCmd {
+                i: party_idx,
+                n,
+                session_type,
+            },
             session_id: session_id.clone(),
         })?;
 
@@ -280,8 +274,8 @@ async fn handle_ws(
                 Some(frame) = ws.next() => {
                     match frame {
                         Ok(axum::extract::ws::Message::Binary(bytes)) => {
-                            let m: protocol::Message<AuxMsg> = serde_json::from_slice(&bytes).unwrap();
-                            tracing::info!("Читаем фрейм: {}, ", m.data);
+                            let m: protocol::Message<Vec<u8>> = serde_json::from_slice(&bytes).unwrap();
+                            tracing::info!("Читаем фрейм");
                             match m.data {
                                 protocol::Data::Outgoing(protocol::Outgoing { recipient, msg }) => {
                                     match recipient {

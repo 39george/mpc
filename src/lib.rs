@@ -1,4 +1,7 @@
-use cggmp24::define_security_level;
+use cggmp24::{
+    define_security_level, security_level::SecurityLevel128,
+    supported_curves::Secp256k1,
+};
 
 pub mod manager;
 pub mod protocol;
@@ -16,6 +19,8 @@ define_security_level!(Mid {
 });
 
 pub type AuxMsg = cggmp24::key_refresh::msg::Msg<sha2::Sha256, Mid>;
+pub type ThresholdMsg =
+    cggmp24_keygen::ThresholdMsg<Secp256k1, SecurityLevel128, sha2::Sha256>;
 
 pub fn error_chain_fmt(
     e: &impl std::error::Error,

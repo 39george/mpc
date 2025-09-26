@@ -1,5 +1,8 @@
 use anyhow::{Context, anyhow};
+use cggmp24::KeyShare;
+use cggmp24::key_share::{DirtyAuxInfo, Valid};
 use cggmp24::progress::Stderr;
+use cggmp24::supported_curves::Secp256k1;
 use cggmp24::{ExecutionId, PregeneratedPrimes, round_based::MpcParty};
 use clap::Parser;
 use futures::SinkExt;
@@ -10,6 +13,8 @@ use futures::{
 use http::header::{CONNECTION, UPGRADE};
 use mpc::{AuxMsg, Mid, protocol};
 use rand::rngs::OsRng;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::future::Future;
 use tokio::net::TcpStream;
@@ -19,10 +24,6 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{Instrument, Level};
 use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt};
 use uuid::Uuid;
-
-// Типы из библиотеки cggmp24, которые нам нужны
-type CggmpIncoming = cggmp24::round_based::Incoming<AuxMsg>;
-type CggmpOutgoing = cggmp24::round_based::Outgoing<AuxMsg>;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -42,12 +43,14 @@ struct Args {
 
 /// Эта функция — сердце транспортного уровня клиента.
 /// Она владеет WebSocket соединением и связывает его с каналами для MPC протокола.
-fn spawn_transport_handler(
+fn spawn_transport_handler<
+    M: Serialize + DeserializeOwned + 'static + Send + Sync,
+>(
     mut ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     // Канал для отправки сообщений, пришедших из сети, в MPC протокол
-    in_tx: UnboundedSender<CggmpIncoming>,
+    in_tx: UnboundedSender<cggmp24::round_based::Incoming<M>>,
     // Канал для получения сообщений от MPC протокола для отправки в сеть
-    mut out_rx: UnboundedReceiver<CggmpOutgoing>,
+    mut out_rx: UnboundedReceiver<cggmp24::round_based::Outgoing<M>>,
     session_id: String,
 ) {
     tokio::spawn(async move {
@@ -58,7 +61,7 @@ fn spawn_transport_handler(
                     // Оборачиваем в наш кастомный протокол
                     let message_to_server = protocol::Message {
                         session_id: session_id.clone(),
-                        data: protocol::Data::Outgoing(protocol::Outgoing::from(out_msg)),
+                        data: protocol::Data::Outgoing(protocol::Outgoing::<Vec<u8>>::try_from(out_msg).unwrap()),
                     };
                     let payload = serde_json::to_vec(&message_to_server).unwrap();
                     if ws.send(Message::binary(payload)).await.is_err() {
@@ -72,14 +75,14 @@ fn spawn_transport_handler(
                     match frame_result {
                         Ok(Message::Binary(bytes)) => {
                             // Десериализуем сообщение от сервера
-                            let Ok(msg) = serde_json::from_slice::<protocol::Message<AuxMsg>>(&bytes) else {
+                            let Ok(msg) = serde_json::from_slice::<protocol::Message<Vec<u8>>>(&bytes) else {
                                 let msg = String::from_utf8_lossy(&bytes);
                                 tracing::error!("failed to parse message from server: {msg}");
                                 continue;
                             };
                             // Если это входящее сообщение для MPC, отправляем его в канал
                             if let protocol::Data::Incoming(incoming) = msg.data {
-                                if in_tx.unbounded_send(incoming.into()).is_err() {
+                                if in_tx.unbounded_send(incoming.try_into().unwrap()).is_err() {
                                     tracing::error!("MPC protocol seems to be finished, exiting transport.");
                                     break;
                                 }
@@ -109,14 +112,19 @@ fn spawn_transport_handler(
 }
 
 // Вспомогательная функция для создания `MpcParty`
-fn make_party(
-    incoming: UnboundedReceiver<CggmpIncoming>,
-    outgoing: UnboundedSender<CggmpOutgoing>,
+fn make_party<M: Serialize + DeserializeOwned + 'static + Send + Sync>(
+    incoming: UnboundedReceiver<cggmp24::round_based::Incoming<M>>,
+    outgoing: UnboundedSender<cggmp24::round_based::Outgoing<M>>,
 ) -> MpcParty<
-    AuxMsg,
+    M,
     (
-        impl futures::Stream<Item = Result<CggmpIncoming, std::convert::Infallible>>,
-        UnboundedSender<CggmpOutgoing>,
+        impl futures::Stream<
+            Item = Result<
+                cggmp24::round_based::Incoming<M>,
+                std::convert::Infallible,
+            >,
+        >,
+        UnboundedSender<cggmp24::round_based::Outgoing<M>>,
     ),
 > {
     MpcParty::connected((incoming.map(Ok), outgoing))
@@ -147,8 +155,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let (i, n) = match message.data {
-        protocol::Data::StartCmd { i, n } => (i, n),
+    let (i, n, session_type) = match message.data {
+        protocol::Data::StartCmd { i, n, session_type } => (i, n, session_type),
         _ => {
             return Err(anyhow!(
                 "Expected SetPartyIdx message, got something else"
@@ -157,18 +165,8 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!("Assigned party index i={i} out of n={n} participants");
 
-    // --- 2. Настройка каналов и запуск транспортного уровня ---
-    let (in_tx, in_rx) = unbounded::<CggmpIncoming>();
-    let (out_tx, out_rx) = unbounded::<CggmpOutgoing>();
-
-    // Запускаем фоновую задачу, которая будет управлять WebSocket соединением
-    spawn_transport_handler(ws, in_tx, out_rx, args.session_id.clone());
-
-    // Создаем `MpcParty`, который будет использовать наши каналы
-    let party = make_party(in_rx, out_tx);
-
     // --- 3. Запуск MPC протокола ---
-    let eid_aux = ExecutionId::new(args.session_id.as_bytes());
+    let eid = ExecutionId::new(args.session_id.as_bytes());
 
     // Пробуем загрузить заранее сгенерированные простые числа, чтобы не ждать каждый раз
     let preg = match read_preg(i) {
@@ -197,23 +195,57 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    tracing::info!("starting AuxInfo generation protocol...");
-    let aux_info_result = cggmp24::aux_info_gen(eid_aux, i, n, preg)
-        .set_progress_tracer(&mut Stderr::new())
-        .start(&mut OsRng, party)
-        .await;
+    match session_type {
+        protocol::SessionType::AuxInfoGen => {
+            let (in_tx, in_rx) =
+                unbounded::<cggmp24::round_based::Incoming<AuxMsg>>();
+            let (out_tx, out_rx) =
+                unbounded::<cggmp24::round_based::Outgoing<AuxMsg>>();
+            spawn_transport_handler(ws, in_tx, out_rx, args.session_id.clone());
+            let party = make_party(in_rx, out_tx);
 
-    match aux_info_result {
-        Ok(aux_info) => {
-            tracing::info!("AuxInfo generation successful!");
-            // В реальном приложении здесь нужно сохранить aux_info для будущего использования
-            let s = serde_json::to_string(&aux_info)?;
-            fs::write(format!("aux_info_{}.json", i), s)?;
-            tracing::info!("saved aux_info to aux_info_{}.json", i);
+            tracing::info!("starting AuxInfo generation protocol...");
+            let aux_info_result = cggmp24::aux_info_gen(eid, i, n, preg)
+                .set_progress_tracer(&mut Stderr::new())
+                .start(&mut OsRng, party)
+                .await;
+
+            match aux_info_result {
+                Ok(aux_info) => {
+                    tracing::info!("AuxInfo generation successful!");
+                    // В реальном приложении здесь нужно сохранить aux_info для будущего использования
+                    let s = serde_json::to_string(&aux_info)?;
+                    fs::write(format!("aux_info_{}.json", i), s)?;
+                    tracing::info!("saved aux_info to aux_info_{}.json", i);
+                }
+                Err(e) => {
+                    anyhow::bail!("AuxInfo generation failed: {:?}", e);
+                }
+            }
         }
-        Err(e) => {
-            anyhow::bail!("AuxInfo generation failed: {:?}", e);
+        protocol::SessionType::KeyGen { threshold } => {
+            let (in_tx, in_rx) = unbounded::<
+                cggmp24::round_based::Incoming<mpc::ThresholdMsg>,
+            >();
+            let (out_tx, out_rx) = unbounded::<
+                cggmp24::round_based::Outgoing<mpc::ThresholdMsg>,
+            >();
+            spawn_transport_handler(ws, in_tx, out_rx, args.session_id.clone());
+            let party = make_party(in_rx, out_tx);
+
+            let dirty = cggmp24::keygen::<Secp256k1>(eid, i, n)
+                .set_threshold(threshold)
+                .set_progress_tracer(&mut cggmp24::progress::Stderr::new())
+                .start(&mut OsRng, party)
+                .await?;
+            let aux_info = read_aux_infos(i)?;
+            let key_share = KeyShare::from_parts((dirty, aux_info))?;
+            let pk = key_share.shared_public_key.to_bytes(false).to_vec(); // агрегированный secp256k1 pubkey
+            let ta =
+                tronic::domain::address::TronAddress::from_pk(&pk).unwrap();
+            tracing::info!("tron addr: {}", ta);
         }
+        protocol::SessionType::Signing => todo!(),
     }
 
     Ok(())
@@ -221,9 +253,14 @@ async fn main() -> anyhow::Result<()> {
 
 // --- Вспомогательные функции ---
 
-// Функция для чтения заранее сгенерированных простых чисел
 fn read_preg(idx: u16) -> anyhow::Result<PregeneratedPrimes<Mid>> {
     let content = fs::read_to_string(format!("preg_{idx}.json"))?;
+    let data = serde_json::from_str(&content)?;
+    Ok(data)
+}
+
+fn read_aux_infos(idx: u16) -> anyhow::Result<Valid<DirtyAuxInfo<Mid>>> {
+    let content = fs::read_to_string(format!("aux_info_{idx}.json"))?;
     let data = serde_json::from_str(&content)?;
     Ok(data)
 }
